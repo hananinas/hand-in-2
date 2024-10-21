@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+option go_package ="./";
+
+// The SecretSharingService defines the RPC methods for sending shares
+service SecretSharingService {
+  // SendShare is used to send a share to another server
+  rpc SendShare(Share) returns (Ack){};
+  rpc SendShareOut(ShareOut) returns (Ack);
+  rpc GetAddedShares(GetAddedSharesRequest) returns (GetAddedSharesResponse);
+  rpc GetAddedOut(GetAddedOutRequest) returns (GetAddedOutResponse);
+}
+
+// Share message represents a part of the secret and the sender's identity
+message Share {
+  int64 part = 1;    // The part of the secret being sent
+  string from = 2;   // Identifier for the sender
+  string to = 3; // Indentifier recivier 
+}
+
+message ShareOut {
+  string from = 1;
+  string to = 2;
+  int64 data = 3;
+}
+
+message Ack {
+  string message = 1;
+}
+
+message GetAddedSharesRequest {
+  string participant = 1;
+}
+
+message GetAddedSharesResponse {
+  int64 addedShares = 1;
+}
+  
+
+message GetAddedOutRequest {
+  string participant = 1;
+}
+
+message GetAddedOutResponse {
+  int64 addedOut = 1;
+}

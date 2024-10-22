@@ -5,8 +5,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -16,9 +16,21 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
-func loadTLSCredentials() (credentials.TransportCredentials, error) {
+var (
+	connPool = sync.Pool{
+		New: func() interface{} {
+			conn, err := createTLSConnection()
+			if err != nil {
+				log.Fatalf("Failed to create connection: %v", err)
+			}
+			return conn
+		},
+	}
+)
+
+func createTLSConnection() (*grpc.ClientConn, error) {
 	// Load certificate of the CA who signed server's certificate
-	pemServerCA, err := ioutil.ReadFile("cert/ca-cert.pem")
+	pemServerCA, err := os.ReadFile("cert/ca-cert.pem")
 	if err != nil {
 		return nil, err
 	}
@@ -28,32 +40,30 @@ func loadTLSCredentials() (credentials.TransportCredentials, error) {
 		return nil, fmt.Errorf("failed to add server CA's certificate")
 	}
 
-	// Create the credentials and return it
-	config := &tls.Config{
+	creds := credentials.NewTLS(&tls.Config{
 		RootCAs: certPool,
+	})
+
+	conn, err := grpc.NewClient("localhost:50051", grpc.WithTransportCredentials(creds))
+	if err != nil {
+		return nil, err
 	}
 
-	return credentials.NewTLS(config), nil
+	return conn, nil
 }
 
-func createClient() pb.SecretSharingServiceClient {
+func getClientConn() *grpc.ClientConn {
+	return connPool.Get().(*grpc.ClientConn)
+}
 
-	tlsCredentials, err := loadTLSCredentials()
-	if err != nil {
-		log.Fatal("cannot load TLS credentials: ", err)
-	}
-
-	conn, err := grpc.NewClient("localhost:50051", grpc.WithTransportCredentials(tlsCredentials))
-	if err != nil {
-		log.Fatalf("did not connect: %v", err)
-	}
-	return pb.NewSecretSharingServiceClient(conn)
+func releaseClientConn(conn *grpc.ClientConn) {
+	connPool.Put(conn)
 }
 
 func sendShare(client pb.SecretSharingServiceClient, share *pb.Share, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 	defer cancel()
 
 	r, err := client.SendShare(ctx, share)
@@ -66,7 +76,7 @@ func sendShare(client pb.SecretSharingServiceClient, share *pb.Share, wg *sync.W
 func sendOutShare(client pb.SecretSharingServiceClient, share *pb.ShareOut, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 	defer cancel()
 
 	r, err := client.SendShareOut(ctx, share)
@@ -79,7 +89,7 @@ func sendOutShare(client pb.SecretSharingServiceClient, share *pb.ShareOut, wg *
 func GetAddedOut(client pb.SecretSharingServiceClient, participant string, wg *sync.WaitGroup) int64 {
 	defer wg.Done()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 	defer cancel()
 
 	log.Printf("Client - Sending GetAddedOut request for participant %s", participant)
@@ -94,7 +104,7 @@ func GetAddedOut(client pb.SecretSharingServiceClient, participant string, wg *s
 func getAddedShares(client pb.SecretSharingServiceClient, participant string, wg *sync.WaitGroup) int64 {
 	defer wg.Done()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 	defer cancel()
 
 	log.Printf("Client - Sending GetAddedShares request for participant %s", participant)
@@ -107,22 +117,27 @@ func getAddedShares(client pb.SecretSharingServiceClient, participant string, wg
 }
 
 func generateShares(value int64) (int64, int64, int64) {
-	part1 := value / 3
-	part2 := value / 3
-	part3 := value / 3
-	return part1, part2, part3
+	// Example share generation logic
+	share1 := value / 3
+	share2 := value / 3
+	share3 := value - share1 - share2
+	log.Printf("Generated shares: %d, %d, %d", share1, share2, share3)
+	return share1, share2, share3
 }
 
 func party1(wg *sync.WaitGroup) {
 	defer wg.Done()
-	client := createClient()
+
+	conn := getClientConn()
+	defer releaseClientConn(conn)
+	client := pb.NewSecretSharingServiceClient(conn)
 
 	x1, x2, x3 := generateShares(30)
 
 	var innerWg sync.WaitGroup
 	innerWg.Add(2)
-	go sendShare(client, &pb.Share{Part: x2, From: "patient1", To: "patient2"}, &innerWg)
-	go sendShare(client, &pb.Share{Part: x3, From: "patient1", To: "patient3"}, &innerWg)
+	go sendShare(client, &pb.Share{Part: x2, From: "Alice", To: "Bob"}, &innerWg)
+	go sendShare(client, &pb.Share{Part: x3, From: "Alice", To: "Charlie"}, &innerWg)
 	innerWg.Wait()
 
 	// Compute local result
@@ -130,22 +145,22 @@ func party1(wg *sync.WaitGroup) {
 	var addedShare int64
 	go func() {
 		defer innerWg.Done()
-		addedShare = getAddedShares(client, "patient1", &innerWg)
+		addedShare = getAddedShares(client, "Alice", &innerWg)
 	}()
 	innerWg.Wait()
 
 	out1 := x1 + addedShare //
 
 	innerWg.Add(2)
-	go sendOutShare(client, &pb.ShareOut{Data: out1, From: "patient1", To: "patient2"}, &innerWg)
-	go sendOutShare(client, &pb.ShareOut{Data: out1, From: "patient1", To: "patient3"}, &innerWg)
+	go sendOutShare(client, &pb.ShareOut{Data: out1, From: "Alice", To: "Bob"}, &innerWg)
+	go sendOutShare(client, &pb.ShareOut{Data: out1, From: "Alice", To: "Charlie"}, &innerWg)
 	innerWg.Wait()
 
 	innerWg.Add(2)
 	var addedOut int64
 	go func() {
 		defer innerWg.Done()
-		addedOut = GetAddedOut(client, "patient1", &innerWg)
+		addedOut = GetAddedOut(client, "Alice", &innerWg)
 	}()
 	innerWg.Wait()
 
@@ -158,14 +173,16 @@ func party1(wg *sync.WaitGroup) {
 
 func party2(wg *sync.WaitGroup) {
 	defer wg.Done()
-	client := createClient()
+	conn := getClientConn()
+	defer releaseClientConn(conn)
+	client := pb.NewSecretSharingServiceClient(conn)
 
 	y1, y2, y3 := generateShares(300)
 
 	var innerWg sync.WaitGroup
 	innerWg.Add(2)
-	go sendShare(client, &pb.Share{Part: y1, From: "patient2", To: "patient1"}, &innerWg)
-	go sendShare(client, &pb.Share{Part: y3, From: "patient2", To: "patient3"}, &innerWg)
+	go sendShare(client, &pb.Share{Part: y1, From: "Bob", To: "Alice"}, &innerWg)
+	go sendShare(client, &pb.Share{Part: y3, From: "Bob", To: "Charlie"}, &innerWg)
 	innerWg.Wait()
 
 	// Compute local result
@@ -173,22 +190,22 @@ func party2(wg *sync.WaitGroup) {
 	var addedShare int64
 	go func() {
 		defer innerWg.Done()
-		addedShare = getAddedShares(client, "patient2", &innerWg)
+		addedShare = getAddedShares(client, "Bob", &innerWg)
 	}()
 	innerWg.Wait()
 
 	out2 := y2 + addedShare //
 
 	innerWg.Add(2)
-	go sendOutShare(client, &pb.ShareOut{Data: out2, From: "patient2", To: "patient1"}, &innerWg)
-	go sendOutShare(client, &pb.ShareOut{Data: out2, From: "patient2", To: "patient3"}, &innerWg)
+	go sendOutShare(client, &pb.ShareOut{Data: out2, From: "Bob", To: "Alice"}, &innerWg)
+	go sendOutShare(client, &pb.ShareOut{Data: out2, From: "patient2", To: "Charlie"}, &innerWg)
 	innerWg.Wait()
 
 	innerWg.Add(2)
 	var addedOut int64
 	go func() {
 		defer innerWg.Done()
-		addedOut = GetAddedOut(client, "patient2", &innerWg)
+		addedOut = GetAddedOut(client, "Bob", &innerWg)
 	}()
 	innerWg.Wait()
 
@@ -201,14 +218,16 @@ func party2(wg *sync.WaitGroup) {
 
 func party3(wg *sync.WaitGroup) {
 	defer wg.Done()
-	client := createClient()
+	conn := getClientConn()
+	defer releaseClientConn(conn)
+	client := pb.NewSecretSharingServiceClient(conn)
 
-	z1, z2, z3 := generateShares(100)
+	z1, z2, z3 := generateShares(30)
 
 	var innerWg sync.WaitGroup
 	innerWg.Add(2)
-	go sendShare(client, &pb.Share{Part: z1, From: "patient3", To: "patient1"}, &innerWg)
-	go sendShare(client, &pb.Share{Part: z3, From: "patient3", To: "patient2"}, &innerWg)
+	go sendShare(client, &pb.Share{Part: z1, From: "Charlie", To: "Alice"}, &innerWg)
+	go sendShare(client, &pb.Share{Part: z3, From: "Charlie", To: "Bob"}, &innerWg)
 	innerWg.Wait()
 
 	// Compute local result
@@ -216,22 +235,22 @@ func party3(wg *sync.WaitGroup) {
 	var addedShare int64
 	go func() {
 		defer innerWg.Done()
-		addedShare = getAddedShares(client, "patient3", &innerWg)
+		addedShare = getAddedShares(client, "Charlie", &innerWg)
 	}()
 	innerWg.Wait()
 
 	out3 := z2 + addedShare //
 
 	innerWg.Add(2)
-	go sendOutShare(client, &pb.ShareOut{Data: out3, From: "patient3", To: "patient1"}, &innerWg)
-	go sendOutShare(client, &pb.ShareOut{Data: out3, From: "patient3", To: "patient2"}, &innerWg)
+	go sendOutShare(client, &pb.ShareOut{Data: out3, From: "Charlie", To: "Alice"}, &innerWg)
+	go sendOutShare(client, &pb.ShareOut{Data: out3, From: "Charlie", To: "Bob"}, &innerWg)
 	innerWg.Wait()
 
 	innerWg.Add(2)
 	var addedOut int64
 	go func() {
 		defer innerWg.Done()
-		addedOut = GetAddedOut(client, "patient3", &innerWg)
+		addedOut = GetAddedOut(client, "Charlie", &innerWg)
 	}()
 	innerWg.Wait()
 
@@ -241,15 +260,18 @@ func party3(wg *sync.WaitGroup) {
 	log.Printf("Client - Patient 3 final output: %d", out)
 }
 
-func StartClient() {
-	var wg sync.WaitGroup
-	wg.Add(3)
+func StartClient(wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	var clientWg sync.WaitGroup
+	clientWg.Add(3)
 
 	// Start each party as a separate goroutine
-	go party1(&wg)
-	go party2(&wg)
-	go party3(&wg)
+	go party1(&clientWg)
+	go party2(&clientWg)
+	go party3(&clientWg)
 
 	// Wait for all parties to complete
-	wg.Wait()
+	clientWg.Wait()
+	log.Println("Client has finished.")
 }
